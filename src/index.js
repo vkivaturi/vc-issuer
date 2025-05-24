@@ -1,9 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { errorHandler } = require('./middleware/errorHandler');
 const credentialRoutes = require('./routes/credentialRoutes');
 const metadataRoutes = require('./routes/metadataRoutes');
+const errorHandler = require('./middleware/errorHandler').errorHandler;
 
 const app = express();
 const PORT = process.env.PORT || 3000;

@@ -1,141 +1,141 @@
-const { v4: uuidv4 } = require('uuid');
-const { ApiError } = require('../middleware/errorHandler');
-const { createAccessToken, signCredential } = require('../utils/joseUtils');
+const { createAccessToken } = require('../utils/joseUtils');
+const { getCredentialForUser, hasCredential } = require('../utils/credentialStore');
+const ApiError = require('../middleware/errorHandler').ApiError;
 
-const createCredentialOffer = async (req, res) => {
-  try {
-    const { credential_type } = req.body;
-    
-    if (!credential_type) {
-      throw new ApiError(400, 'credential_type is required');
-    }
-    
-    const credentialOffer = {
-      credential_issuer: `http://localhost:${process.env.PORT}`,
-      credentials: [
-        {
-          format: 'jwt_vc',
-          types: [credential_type]
-        }
-      ],
-      grants: {
-        urn: {
-          'urn:ietf:params:oauth:grant-type:pre-authorized_code': {
-            'pre-authorized_code': uuidv4(),
-            'user_pin_required': false
-          }
-        }
+// Add environment variable check at the top
+if (!process.env.ISSUER_PRIVATE_KEY) {
+  console.error('ISSUER_PRIVATE_KEY environment variable is not set');
+  process.exit(1);
+}
+
+if (!process.env.ISSUER_KID) {
+  console.error('ISSUER_KID environment variable is not set');
+  process.exit(1);
+}
+
+const createCredentialOffer = (req, res) => {
+  const { credential_type, user_id } = req.body;
+  
+  if (!credential_type) {
+    throw new ApiError(400, 'credential_type is required');
+  }
+
+  if (!user_id) {
+    throw new ApiError(400, 'user_id is required');
+  }
+
+  if (!hasCredential(user_id)) {
+    throw new ApiError(404, 'No credential found for this user');
+  }
+
+  // Generate a random pre-authorized code
+  const preAuthorizedCode = require('crypto').randomUUID();
+
+  // Store the pre-authorized code with user_id for later verification
+  // In a real implementation, this should be stored in a database
+  global.preAuthCodeMapping = global.preAuthCodeMapping || new Map();
+  global.preAuthCodeMapping.set(preAuthorizedCode, user_id);
+
+  const credentialOffer = {
+    credential_issuer: 'http://localhost:3000',
+    credential_configuration_ids: [credential_type],
+    grants: {
+      'urn:ietf:params:oauth:grant-type:pre-authorized_code': {
+        'pre-authorized_code': preAuthorizedCode,
+        user_pin_required: false
       }
-    };
-
-    res.json(credentialOffer);
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error;
     }
-    throw new ApiError(500, `Error creating credential offer: ${error.message}`);
+  };
+
+  res.json(credentialOffer);
+};
+
+const getToken = async (req, res) => {
+  console.log('Token request body:', req.body);
+  
+  const grantType = req.body.grant_type;
+  const preAuthorizedCode = req.body.preAuthorizedCode || req.body['pre-authorized_code'];
+
+  if (!grantType || !preAuthorizedCode) {
+    throw new ApiError(400, `Missing required parameters. Received: grant_type=${grantType}, pre-authorized_code=${preAuthorizedCode}`);
+  }
+
+  if (grantType !== 'urn:ietf:params:oauth:grant-type:pre-authorized_code') {
+    throw new ApiError(400, 'Invalid grant_type');
+  }
+
+  // Verify the pre-authorized code and get the associated user_id
+  if (!global.preAuthCodeMapping || !global.preAuthCodeMapping.has(preAuthorizedCode)) {
+    throw new ApiError(400, 'Invalid pre-authorized code');
+  }
+
+  const userId = global.preAuthCodeMapping.get(preAuthorizedCode);
+  
+  try {
+    const accessToken = await createAccessToken(
+      { sub: userId },
+      process.env.ISSUER_PRIVATE_KEY,
+      process.env.ISSUER_KID
+    );
+    
+    // Store the access token for later verification
+    global.accessTokenMapping = global.accessTokenMapping || new Map();
+    global.accessTokenMapping.set(accessToken, userId);
+
+    // Remove the used pre-authorized code
+    global.preAuthCodeMapping.delete(preAuthorizedCode);
+
+    res.json({
+      access_token: accessToken,
+      token_type: 'Bearer',
+      expires_in: 3600
+    });
+  } catch (error) {
+    console.error('Token generation error:', error);
+    throw new ApiError(500, `Error generating token: ${error.message}`);
   }
 };
 
 const issueCredential = async (req, res) => {
-  try {
-    const { credential_type, claims } = req.body;
-    
-    if (!credential_type || !claims) {
-      throw new ApiError(400, 'credential_type and claims are required');
-    }
-    
-    // Validate the access token from authorization header
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      throw new ApiError(401, 'No authorization token provided');
-    }
-
-    const credential = {
-      '@context': [
-        'https://www.w3.org/2018/credentials/v1',
-        'https://www.w3.org/2018/credentials/examples/v1'
-      ],
-      type: ['VerifiableCredential', credential_type],
-      issuer: process.env.ISSUER_DID,
-      issuanceDate: new Date().toISOString(),
-      credentialSubject: claims
-    };
-
-    const signedCredential = await signCredential(
-      credential,
-      process.env.ISSUER_PRIVATE_KEY,
-      process.env.ISSUER_KID
-    );
-
-    res.json({
-      format: 'jwt_vc',
-      credential: signedCredential
-    });
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error;
-    }
-    throw new ApiError(500, `Error issuing credential: ${error.message}`);
+  const accessToken = req.headers.authorization?.split(' ')[1];
+  
+  if (!accessToken) {
+    throw new ApiError(401, 'Access token is required');
   }
-};
 
-const getToken = async (req, res) => {
-  try {
-    console.log('Token request body:', req.body);
-    
-    if (!process.env.ISSUER_PRIVATE_KEY) {
-      throw new ApiError(500, 'ISSUER_PRIVATE_KEY environment variable is not set');
-    }
-    
-    if (!process.env.ISSUER_KID) {
-      throw new ApiError(500, 'ISSUER_KID environment variable is not set');
-    }
-
-    const { grant_type } = req.body;
-    // Handle both parameter formats (hyphenated and camelCase)
-    const preAuthorizedCode = req.body['pre-authorized_code'] || req.body.preAuthorizedCode;
-    
-    console.log('Extracted values:', { grant_type, preAuthorizedCode });
-    
-    if (!grant_type || !preAuthorizedCode) {
-      throw new ApiError(400, `Missing required parameters. Received: grant_type=${grant_type}, pre-authorized_code=${preAuthorizedCode}`);
-    }
-
-    if (grant_type !== 'urn:ietf:params:oauth:grant-type:pre-authorized_code') {
-      throw new ApiError(400, `Invalid grant type. Expected 'urn:ietf:params:oauth:grant-type:pre-authorized_code' but received '${grant_type}'`);
-    }
-
-    try {
-      const accessToken = await createAccessToken(
-        { 
-          sub: uuidv4(),
-          preAuthorizedCode 
-        },
-        process.env.ISSUER_PRIVATE_KEY,
-        process.env.ISSUER_KID
-      );
-
-      res.json({
-        access_token: accessToken,
-        token_type: 'Bearer',
-        expires_in: 3600
-      });
-    } catch (tokenError) {
-      console.error('Token generation error:', tokenError);
-      throw new ApiError(500, `Error generating token: ${tokenError.message}`);
-    }
-  } catch (error) {
-    console.error('Token endpoint error:', error);
-    if (error instanceof ApiError) {
-      throw error;
-    }
-    throw new ApiError(500, `Unexpected error in token generation: ${error.message}`);
+  // Verify the access token and get the associated user_id
+  if (!global.accessTokenMapping || !global.accessTokenMapping.has(accessToken)) {
+    throw new ApiError(401, 'Invalid access token');
   }
+
+  const userId = global.accessTokenMapping.get(accessToken);
+  const credential = getCredentialForUser(userId);
+
+  if (!credential) {
+    throw new ApiError(404, 'No credential found for this user');
+  }
+
+  // Remove the used access token
+  global.accessTokenMapping.delete(accessToken);
+
+  // Add issuance date and validity period
+  const now = new Date();
+  const enrichedCredential = {
+    ...credential,
+    issuanceDate: now.toISOString(),
+    validFrom: now.toISOString(),
+    validUntil: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString(), // Valid for 1 year
+    issuer: 'http://localhost:3000'
+  };
+
+  res.json({
+    credential: enrichedCredential,
+    format: 'jwt_vc'
+  });
 };
 
 module.exports = {
   createCredentialOffer,
-  issueCredential,
-  getToken
+  getToken,
+  issueCredential
 }; 
