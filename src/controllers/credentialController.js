@@ -1,5 +1,5 @@
 const { createAccessToken } = require('../utils/joseUtils');
-const { getCredentialForUser, hasCredential } = require('../utils/credentialStore');
+const { checkCredentialAvailability, getCredentialDetails } = require('../utils/dbUtils');
 const ApiError = require('../middleware/errorHandler').ApiError;
 
 // Add environment variable check at the top
@@ -13,7 +13,7 @@ if (!process.env.ISSUER_KID) {
   process.exit(1);
 }
 
-const createCredentialOffer = (req, res) => {
+const createCredentialOffer = async (req, res) => {
   const { credential_type, user_id } = req.body;
   
   if (!credential_type) {
@@ -24,8 +24,9 @@ const createCredentialOffer = (req, res) => {
     throw new ApiError(400, 'user_id is required');
   }
 
-  if (!hasCredential(user_id)) {
-    throw new ApiError(404, 'No credential found for this user');
+  const hasValidCredential = await checkCredentialAvailability(user_id, credential_type);
+  if (!hasValidCredential) {
+    throw new ApiError(404, 'No valid credential found for this user');
   }
 
   // Generate a random pre-authorized code
@@ -71,29 +72,24 @@ const getToken = async (req, res) => {
 
   const userId = global.preAuthCodeMapping.get(preAuthorizedCode);
   
-  try {
-    const accessToken = await createAccessToken(
-      { sub: userId },
-      process.env.ISSUER_PRIVATE_KEY,
-      process.env.ISSUER_KID
-    );
-    
-    // Store the access token for later verification
-    global.accessTokenMapping = global.accessTokenMapping || new Map();
-    global.accessTokenMapping.set(accessToken, userId);
+  const accessToken = await createAccessToken(
+    { sub: userId },
+    process.env.ISSUER_PRIVATE_KEY,
+    process.env.ISSUER_KID
+  );
+  
+  // Store the access token for later verification
+  global.accessTokenMapping = global.accessTokenMapping || new Map();
+  global.accessTokenMapping.set(accessToken, userId);
 
-    // Remove the used pre-authorized code
-    global.preAuthCodeMapping.delete(preAuthorizedCode);
+  // Remove the used pre-authorized code
+  global.preAuthCodeMapping.delete(preAuthorizedCode);
 
-    res.json({
-      access_token: accessToken,
-      token_type: 'Bearer',
-      expires_in: 3600
-    });
-  } catch (error) {
-    console.error('Token generation error:', error);
-    throw new ApiError(500, `Error generating token: ${error.message}`);
-  }
+  res.json({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: 3600
+  });
 };
 
 const issueCredential = async (req, res) => {
@@ -109,8 +105,8 @@ const issueCredential = async (req, res) => {
   }
 
   const userId = global.accessTokenMapping.get(accessToken);
-  const credential = getCredentialForUser(userId);
-
+  const credential = await getCredentialDetails(userId);
+  
   if (!credential) {
     throw new ApiError(404, 'No credential found for this user');
   }
@@ -118,15 +114,22 @@ const issueCredential = async (req, res) => {
   // Remove the used access token
   global.accessTokenMapping.delete(accessToken);
 
-  // Add issuance date and validity period
+  // Add issuance date and validity period if not present
   const now = new Date();
   const enrichedCredential = {
     ...credential,
-    issuanceDate: now.toISOString(),
+    issuanceDate: credential.issuanceDate || now.toISOString(),
     validFrom: now.toISOString(),
     validUntil: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString(), // Valid for 1 year
     issuer: 'http://localhost:3000'
   };
+
+  // For VendorPermit, convert permit_image to base64 if it's a Buffer
+  if (enrichedCredential.type === 'VendorPermit' && enrichedCredential.permitImage) {
+    if (Buffer.isBuffer(enrichedCredential.permitImage)) {
+      enrichedCredential.permitImage = enrichedCredential.permitImage.toString('base64');
+    }
+  }
 
   res.json({
     credential: enrichedCredential,
