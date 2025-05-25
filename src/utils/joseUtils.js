@@ -72,5 +72,7 @@ const signCredential = async (credential, privateKeyPem, kid) => {
 module.exports = {
   createAccessToken,
   verifyToken,
-  signCredential
+  signCredential,
+  importPrivateKey,
+  importPublicKey
 }; 

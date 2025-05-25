@@ -1,5 +1,6 @@
-const { createAccessToken } = require('../utils/joseUtils');
+const { createAccessToken, signCredential } = require('../utils/joseUtils');
 const { checkCredentialAvailability, getCredentialDetails } = require('../utils/dbUtils');
+const { createSha256Hash } = require('../utils/hashUtils');
 const ApiError = require('../middleware/errorHandler').ApiError;
 
 // Add environment variable check at the top
@@ -116,25 +117,52 @@ const issueCredential = async (req, res) => {
 
   // Add issuance date and validity period if not present
   const now = new Date();
-  const enrichedCredential = {
-    ...credential,
+  const credentialMetadata = {
+    id: credential.id,
+    type: credential.type,
+    issuer: 'http://localhost:3000',
     issuanceDate: credential.issuanceDate || now.toISOString(),
     validFrom: now.toISOString(),
     validUntil: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString(), // Valid for 1 year
-    issuer: 'http://localhost:3000'
+    subject: {
+      id: credential.userId
+    }
   };
 
-  // For VendorPermit, convert permit_image to base64 if it's a Buffer
-  if (enrichedCredential.type === 'VendorPermit' && enrichedCredential.permitImage) {
-    if (Buffer.isBuffer(enrichedCredential.permitImage)) {
-      enrichedCredential.permitImage = enrichedCredential.permitImage.toString('base64');
-    }
+  // Prepare the response object
+  const response = {
+    format: 'jwt_vc'
+  };
+
+  // Handle VendorPermit specific data
+  if (credential.type === 'VendorPermit' && credential.permitImage) {
+    // Create hash of the permit image
+    const imageHash = createSha256Hash(credential.permitImage);
+    
+    // Add image hash to the credential that will be signed
+    credentialMetadata.evidence = {
+      type: 'PermitImage',
+      permitImageHash: `sha256:${imageHash}`
+    };
+
+    // Add the actual image to attachments
+    response.attachments = {
+      permitImage: credential.permitImage.toString('base64'),
+      imageUpdatedAt: credential.imageUpdatedAt
+    };
   }
 
-  res.json({
-    credential: enrichedCredential,
-    format: 'jwt_vc'
-  });
+  // Sign the credential
+  const signedCredential = await signCredential(
+    credentialMetadata,
+    process.env.ISSUER_PRIVATE_KEY,
+    process.env.ISSUER_KID
+  );
+
+  // Add the signed credential to the response
+  response.credential = signedCredential;
+
+  res.json(response);
 };
 
 module.exports = {
